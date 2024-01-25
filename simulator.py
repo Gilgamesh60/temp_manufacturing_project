@@ -2,6 +2,8 @@ import numpy as np
 import copy
 import math
 import cvxpy as cp
+from synthetic_data_generator import synthetic_exo_data_generator
+
 
 exogenous_cost_attr = ['spot_price', 'holding_cost', 'waste_disposal_cost', 'exchange_transport_cost', 'spot_transport_cost']
 
