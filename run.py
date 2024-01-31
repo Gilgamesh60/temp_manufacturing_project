@@ -2,7 +2,7 @@ from simulator import Manufacturing_Simulator
 from utils import PPO
 import logging
 
- hyperparameters = {
+hyperparameters = {
         'timesteps_per_batch': 2048,
         'max_timesteps_per_episode': 200,
         'gamma': 0.99,
