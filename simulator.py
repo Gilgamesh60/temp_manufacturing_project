@@ -1,10 +1,16 @@
 import numpy as np
 import copy
 import math
-import cvxpy as cp
 from synthetic_data_generator import synthetic_exo_data_generator
-
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import Adam
+import torch.nn.functional as F
+from torch.autograd import Variable
+import time
+from torch.distributions import MultivariateNormal
+from get_buyer_demands import get_buyer_quantities
 exogenous_cost_attr = ['spot_price', 'holding_cost', 'waste_disposal_cost', 'exchange_transport_cost', 'spot_transport_cost']
 
 exogenous_qty_attr = ['recycled_qty', 'waste_qty', 'produced_qty','total_demand_qty']
@@ -37,46 +43,72 @@ class Manufacturing_Simulator:
         self.decay_factor = decay_factor
 
     def step(self,action):
+      '''
+      step function takes the actions to the environment as an input and calculates
+      the next state observation and reward.
+      input action should be a 1-D array of size [n_agents*1]
+
+      For each agent, it calls the get_buyer_quantities function to get the spot and
+      exchange demand quantities by all the other agents.
+      Based on that and other exogenous attributes, it updates the current inventory of the
+      seller agent. Then it updates the obs state of that seller and calculates the reward.
+      '''
+
       action = list(action)
       for i in range(len(action)):
         self.exchange_price_action_dict['agent{}'.format(i+1)] = action[i]
 
-      total_reward = []
-      buyer_reward = []
-      seller_reward = []
+      seller_reward_dict = {}
+      buyer_reward_dict = {}
       k = []
-      # next_obs, inventory and reward for each agent
       for i in range(self.agents):
-        #buyer decision calculation using get_buyer_quantities which optimizes the objective fn using cvxpy
-        spot_demand_qty_agent, exchange_demand_qty_agent ,waste_exchange_qty_agent,buyer_reward_agent = self.get_buyer_quantities(f'agent{i+1}',self.complete_dict[f'data_dict_agent{i+1}'])
+        #for each agent, get the spot,exchange,waste demands and also the buyer rewards of other agents.
+        spot_demand_qty_agent, exchange_demand_qty_agent ,waste_exchange_qty_agent,buyer_reward_total = get_buyer_quantities(f'agent{i+1}')
 
+        
         prev_inventory_qty = self.current_inventory_dict[f'agent{i+1}']
-
-        # waste qty calculation : Subtracting the decayed part and waste_exchange_qty from waste_qty[t] to get waste_qty[t+1]. We put max to ensure that waste_qty>=0.
+        # waste qty calculation => subtract the decaying factor and waste exchange demand by other agents
         self.complete_dict[f'data_dict_agent{i+1}']['waste_qty'][self.t+1] = max(0,self.complete_dict[f'data_dict_agent{i+1}']['waste_qty'][self.t]
-                                                                                 - waste_exchange_qty_agent
-                                                                                 -self.decay_factor*self.complete_dict[f'data_dict_agent{i+1}']['waste_qty'][self.t])
+                                                                                 - sum(waste_exchange_qty_agent.values())
+                                                                                  -self.decay_factor*self.complete_dict[f'data_dict_agent{i+1}']['waste_qty'][self.t])
+         
+        #calculate the current inventory using => curr_invent = prev_invent + produced_qty - sum(exchange demands of all agents) - sum(waste exchange demands by all agents)
+        self.current_inventory_dict[f'agent{i+1}'] = max(0,prev_inventory_qty + 
+                                                           self.complete_dict['data_dict_agent{}'.format(i+1)]['produced_qty'][self.t]
+                                                         - sum(exchange_demand_qty_agent.values()) 
+                                                         - sum(waste_exchange_qty_agent.values()))
+        
+        # total demand by all agents to current seller agent.
+        total_demand_agent = sum(spot_demand_qty_agent.values()) + sum(exchange_demand_qty_agent.values()) + sum(waste_exchange_qty_agent.values())
 
-        # current inventory calculation step
-        self.current_inventory_dict[f'agent{i+1}'] = max(0,prev_inventory_qty
-                                                         + self.complete_dict['data_dict_agent{}'.format(i+1)]['produced_qty'][self.t]
-                                                         - exchange_demand_qty_agent 
-                                                         - min(waste_exchange_qty_agent,self.complete_dict[f'data_dict_agent{i+1}']['waste_qty'][self.t]) 
-                                                         - self.complete_dict['data_dict_agent{}'.format(i+1)]['waste_qty'][self.t])
-        # next_obs calculation step
-        total_demand_agent = spot_demand_qty_agent + exchange_demand_qty_agent + waste_exchange_qty_agent
+        #update the observation state of current seller agent
         next_obs_agent = np.concatenate(
           (self.obs_dict['current_obs_agent{}'.format(i+1)][1:self.lead_time],np.array([total_demand_agent]),np.array([self.current_inventory_dict[f'agent{i+1}']]),np.array([self.complete_dict['data_dict_agent{}'.format(i+1)]['spot_price'][self.t+1]]),np.array([self.complete_dict['data_dict_agent{}'.format(i+1)]['waste_qty'][self.t+1]]),np.array([self.complete_dict['data_dict_agent{}'.format(i+1)]['produced_qty'][self.t+1]]),np.array([self.complete_dict['data_dict_agent{}'.format(i+1)]['holding_cost'][self.t+1]]),np.array([self.complete_dict['data_dict_agent{}'.format(i+1)]['seller_init_inventory']]))
       )
+        #add that state to overall state observation array
         k+=[next_obs_agent]
 
-        # seller rewards , buyer rewards and total rewards by the agent.
-        seller_reward_agent = self.exchange_price_action_dict['agent{}'.format(i+1)]*min(self.current_inventory_dict[f'agent{i+1}'],exchange_demand_qty_agent+waste_exchange_qty_agent) + self.transport_cost(exchange_demand_qty_agent+waste_exchange_qty_agent) - self.complete_dict['data_dict_agent{}'.format(i+1)]['waste_disposal_cost'][self.t] - self.complete_dict['data_dict_agent{}'.format(i+1)]['holding_cost'][self.t]
-        total_reward_agent = buyer_reward_agent + seller_reward_agent
-        total_reward.append(total_reward_agent)
-        seller_reward.append(seller_reward_agent)
-        buyer_reward.append(buyer_reward_agent)
+        #calculate the seller reward for each seller agent
+        seller_reward_agent = self.exchange_price_action_dict['agent{}'.format(i+1)]*min(self.current_inventory_dict[f'agent{i+1}'],sum(exchange_demand_qty_agent.values()) + sum(waste_exchange_qty_agent.values()))
+        for j in exchange_demand_qty_agent:
+          seller_reward_agent+=self.transport_cost(exchange_demand_qty_agent[j]+waste_exchange_qty_agent[j])
+        seller_reward_agent-=self.complete_dict['data_dict_agent{}'.format(i+1)]['waste_disposal_cost'][self.t]
+        seller_reward_agent-=self.complete_dict['data_dict_agent{}'.format(i+1)]['holding_cost'][self.t]*self.current_inventory_dict[f'agent{i+1}']
+        seller_reward_dict[f'agent{i+1}'] = seller_reward_agent
 
+        #save the buyer rewards calculated by get_buyer_quantities in the buyer_rewards_dict.
+        for buyer in buyer_reward_total:
+           buyer_reward_dict[buyer] = buyer_reward_total[buyer]
+
+      #save all the seller,buyer and total rewards.
+      total_rewards = []
+      seller_rewards = []
+      buyer_rewards = []
+      for i in range(self.agents):
+        seller_rewards.append(seller_reward_dict[f'agent{i+1}'])
+        buyer_rewards.append(buyer_reward_dict[f'agent{i+1}'])
+        total_rewards.append(seller_reward_dict[f'agent{i+1}']+buyer_reward_dict[f'agent{i+1}'])
+      
       next_obs = np.array(k)
       self.t+=1
       done = False
@@ -85,11 +117,10 @@ class Manufacturing_Simulator:
 
       self.current_obs = next_obs
 
-      return next_obs , np.array(total_reward)  , done, {'buyer_reward':np.array(buyer_reward), 'seller_reward':np.array(seller_reward)}
+      return next_obs , np.array(seller_rewards)  , done, {'buyer_reward':np.array(buyer_rewards), 'total_reward':np.array(total_rewards)}
 
 
     def reset(self):
-      # reset step. returns the obs_dict which contains the basic state for all agents.
       self.t = 0
       for i in range(self.agents):
         self.complete_dict['data_dict_agent{}'.format(i+1)] =  synthetic_exo_data_generator(total_timesteps= self.T+self.lead_time)
@@ -117,27 +148,7 @@ class Manufacturing_Simulator:
 
     def waste_cost(waste_qty):
       pass
-
-    def get_buyer_quantities(self,agent,dt):
-        # function to return the spot and exchange demands by maxmizing the buyer objective function mentioned in the draft.
         
-        buyer_spot_qty = cp.Variable(nonneg=True)
-        buyer_exchange_qty = cp.Variable(nonneg=True)
-        waste_exchange_qty = cp.Variable(nonneg=True)
-
-        function = self.utility(buyer_spot_qty+buyer_exchange_qty)- dt['spot_price'][self.t]*buyer_spot_qty- self.transport_cost(buyer_spot_qty)
-        function += self.waste_utility(waste_exchange_qty)
-        function-= self.exchange_price_action_dict[agent]*buyer_exchange_qty
-        function-= self.exchange_price_action_dict[agent]*waste_exchange_qty
-
-        objective = cp.Maximize(function)
-        total_demand = buyer_spot_qty+buyer_exchange_qty+waste_exchange_qty
-        constraints = [total_demand<=dt['buyer_init_inventory']]
-        problem = cp.Problem(objective, constraints)
-        problem.solve()
-        return buyer_spot_qty.value,buyer_exchange_qty.value,waste_exchange_qty.value,problem.value
-
-
     def rollout(self):
         batch_obs = []             # batch observations
         batch_acts = []            # batch actions
